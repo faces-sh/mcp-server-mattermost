@@ -8,6 +8,7 @@ from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from .logging import logger, request_id_var
+from . import circuit_buffer   # Maestro handle bus (docs/reqs/007); no-op outside Maestro
 
 
 class LoggingMiddleware(Middleware):
@@ -143,3 +144,29 @@ class LoggingMiddleware(Middleware):
             Filtered dict with only safe params
         """
         return {k: v for k, v in params.items() if k in self.WHITELISTED_PARAMS}
+
+
+class CircuitMiddleware(Middleware):
+    """Maestro handle bus (docs/reqs/007): expand any @@hN@@ handle in a tool's arguments before it runs, and
+    park a large text result behind a handle on the way out so it can flow into the next tool by reference.
+    No-op when the circuit env is absent (server run outside Maestro), so the server still works standalone.
+    """
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext,
+        call_next: Callable[[MiddlewareContext], Awaitable[Any]],
+    ) -> Any:  # noqa: ANN401
+        try:
+            if context.message is not None and getattr(context.message, "arguments", None):
+                context.message.arguments = circuit_buffer.resolve_args(context.message.arguments)
+        except Exception:  # noqa: BLE001 - a circuit hiccup must never break a tool call
+            pass
+        result = await call_next(context)
+        try:
+            content = getattr(result, "content", None)
+            if content and getattr(content[0], "type", None) == "text":
+                content[0].text = circuit_buffer.wrap_result(content[0].text)
+        except Exception:  # noqa: BLE001
+            pass
+        return result

@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse
 from .auth_factory import build_auth_provider_from_env
 from .config import get_settings
 from .logging import logger, setup_logging
-from .middleware import LoggingMiddleware
+from .middleware import CircuitMiddleware, LoggingMiddleware
 from .tls import install_extra_ca_certs
 
 
@@ -60,6 +60,7 @@ def _create_mcp() -> FastMCP:
 
 mcp = _create_mcp()
 mcp.add_middleware(LoggingMiddleware())
+mcp.add_middleware(CircuitMiddleware())   # Maestro handle bus (docs/reqs/007)
 
 
 @mcp.custom_route("/health", methods=["GET"])
