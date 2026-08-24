@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse
 from .auth_factory import build_auth_provider_from_env
 from .config import get_settings
 from .logging import logger, setup_logging
-from .middleware import CircuitMiddleware, LoggingMiddleware
+from .middleware import CircuitMiddleware, EnvelopeMiddleware, LoggingMiddleware
 from .tls import install_extra_ca_certs
 
 
@@ -59,6 +59,10 @@ def _create_mcp() -> FastMCP:
 
 
 mcp = _create_mcp()
+# Order is the contract: the first middleware added is the OUTERMOST. The envelope goes first so
+# it wraps everything, including anything the other two raise, and so the logging middleware still
+# sees the raw exception rather than an already-formatted error result.
+mcp.add_middleware(EnvelopeMiddleware())  # uniform failure envelope (docs/MCP_FAILURE_ENVELOPE.md)
 mcp.add_middleware(LoggingMiddleware())
 mcp.add_middleware(CircuitMiddleware())   # Maestro handle bus (docs/reqs/007)
 

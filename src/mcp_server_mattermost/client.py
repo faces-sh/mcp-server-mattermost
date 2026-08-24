@@ -1,6 +1,8 @@
 """Async HTTP client for Mattermost API v4."""
 
 import asyncio
+import socket
+import ssl
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,11 +16,14 @@ from tenacity import RetryCallState, retry, retry_if_exception, stop_after_attem
 
 from .config import Settings
 from .constants import UPDATE_BOOKMARK_RESPONSE_KEY
-from .exceptions import AuthenticationError, MattermostAPIError, NotFoundError, RateLimitError
+from .exceptions import AuthenticationError, MattermostAPIError, NotFoundError, RateLimitError, TransportError
 from .logging import logger, request_id_var
 
 
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+# How far down an exception chain to look for the socket error that names the transport failure.
+_CAUSE_CHAIN_LIMIT = 8
 
 
 def _is_retryable_exception(exc: BaseException) -> bool:
@@ -70,6 +75,48 @@ def _wait_for_rate_limit(retry_state: RetryCallState) -> float:
 
     # Otherwise use exponential backoff: 1s, 2s, 4s, 8s... (max 10s)
     return float(wait_exponential(multiplier=1, min=1, max=10)(retry_state))
+
+
+# One return per case IS the classification here, so the return-count rule is waived.
+def _transport_error(exc: httpx.HTTPError) -> TransportError:  # noqa: PLR0911
+    """Classify a request that never produced an HTTP response.
+
+    The four cases a user can actually tell apart (nothing listening, a name that does not
+    resolve, a certificate that does not verify, a server that never answered) get their own
+    code so the caller is not left inferring them from prose. Classification reads the
+    exception CHAIN, not the message text: httpx wraps the original OSError through httpcore,
+    so the socket error that says which case it is sits two levels down.
+
+    Args:
+        exc: The httpx error raised instead of a response.
+
+    Returns:
+        A TransportError carrying the envelope code and the underlying text.
+    """
+    detail = str(exc) or type(exc).__name__
+
+    if isinstance(exc, httpx.TooManyRedirects):
+        return TransportError("too_many_redirects", detail)
+    if isinstance(exc, httpx.TimeoutException):
+        return TransportError("timeout", detail)
+
+    seen: list[BaseException] = []
+    cursor: BaseException | None = exc
+    while cursor is not None and len(seen) < _CAUSE_CHAIN_LIMIT:
+        seen.append(cursor)
+        cursor = cursor.__cause__ or cursor.__context__
+
+    for cause in seen:
+        if isinstance(cause, ssl.SSLError):
+            return TransportError("tls_error", detail)
+        if isinstance(cause, socket.gaierror):
+            return TransportError("dns_failure", detail)
+        if isinstance(cause, ConnectionRefusedError):
+            return TransportError("connection_refused", detail)
+
+    if isinstance(exc, httpx.ConnectError):
+        return TransportError("connection_failed", detail)
+    return TransportError("network_error", detail)
 
 
 class MattermostClient:
@@ -199,6 +246,18 @@ class MattermostClient:
             logger.debug("Failed to parse error response as JSON, using raw text")
         return response.text, None
 
+    @staticmethod
+    def _response_evidence(response: httpx.Response) -> dict[str, str]:
+        """Capture the parts of a response the failure envelope reproduces without interpreting.
+
+        Args:
+            response: HTTP response from API
+
+        Returns:
+            Keyword arguments carrying the reason phrase and the verbatim body.
+        """
+        return {"reason_phrase": response.reason_phrase, "body": response.text}
+
     def _parse_retry_after(self, header: str) -> int | None:
         """Parse Retry-After header value (integer seconds or HTTP-date).
 
@@ -231,32 +290,46 @@ class MattermostClient:
             Parsed JSON body or None for empty responses
 
         Raises:
+            MattermostAPIError: If the server redirected and this client does not follow it
             AuthenticationError: If authentication failed (401)
             NotFoundError: If resource not found (404)
             RateLimitError: If rate limited (429)
             MattermostAPIError: For other API errors (4xx, 5xx)
         """
+        # Every raise below carries the response VERBATIM. Mattermost answers an expired token
+        # and a permission the account never had with the same status, and only the body tells
+        # them apart, so the body travels with the failure instead of being summarised here.
+        evidence = self._response_evidence(response)
+
+        # A redirect this client does not follow is a FAILURE, not an empty answer. It used to fall
+        # through to "no content" and return None, which the tools turned into [] or {}: a proxy
+        # bouncing the call to an SSO login page reported an empty channel list (rule 6).
+        if response.is_redirect:
+            location = response.headers.get("Location", "")
+            msg = f"Redirect not followed: {location}" if location else "Redirect not followed"
+            raise MattermostAPIError(msg, status_code=response.status_code, **evidence)
+
         if response.status_code == HTTPStatus.UNAUTHORIZED:
-            raise AuthenticationError
+            raise AuthenticationError(**evidence)
 
         if response.status_code == HTTPStatus.NOT_FOUND:
             message, error_id = self._parse_error_response(response)
-            raise NotFoundError(message, error_id=error_id)
+            raise NotFoundError(message, error_id=error_id, **evidence)
 
         if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
             retry_after_header = response.headers.get("Retry-After")
             retry_after = self._parse_retry_after(retry_after_header) if retry_after_header else None
-            raise RateLimitError(retry_after)
+            raise RateLimitError(retry_after, **evidence)
 
         if response.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
             message, error_id = self._parse_error_response(response)
             msg = f"Server error: {message}"
-            raise MattermostAPIError(msg, status_code=response.status_code, error_id=error_id)
+            raise MattermostAPIError(msg, status_code=response.status_code, error_id=error_id, **evidence)
 
         if response.status_code >= HTTPStatus.BAD_REQUEST:
             message, error_id = self._parse_error_response(response)
             msg = f"Client error: {message}"
-            raise MattermostAPIError(msg, status_code=response.status_code, error_id=error_id)
+            raise MattermostAPIError(msg, status_code=response.status_code, error_id=error_id, **evidence)
 
         if not response.content:
             return None
@@ -286,13 +359,17 @@ class MattermostClient:
             NotFoundError: If resource not found
             RateLimitError: If rate limited (after retries exhausted)
             MattermostAPIError: For other API errors
+            TransportError: If the request never reached the server
         """
         retrying = self._make_retrying()
 
         @retrying
         async def _do_request() -> dict[str, Any] | list[Any] | None:
             self._log_http_request(method, endpoint)
-            response = await self._http.request(method, endpoint, **kwargs)
+            try:
+                response = await self._http.request(method, endpoint, **kwargs)
+            except httpx.HTTPError as exc:
+                raise _transport_error(exc) from exc
             self._log_http_response(response.status_code)
             return self._handle_response(response)
 
@@ -1109,12 +1186,15 @@ class MattermostClient:
         @retrying
         async def _do_upload() -> dict[str, Any] | list[Any] | None:
             self._log_http_request("POST", "/files")
-            response = await self._http.post(
-                "/files",
-                params={"channel_id": channel_id, "filename": filename},
-                data={"channel_id": channel_id},
-                files={"files": (filename, content)},
-            )
+            try:
+                response = await self._http.post(
+                    "/files",
+                    params={"channel_id": channel_id, "filename": filename},
+                    data={"channel_id": channel_id},
+                    files={"files": (filename, content)},
+                )
+            except httpx.HTTPError as exc:
+                raise _transport_error(exc) from exc
             self._log_http_response(response.status_code)
             return self._handle_response(response)
 
