@@ -1,5 +1,6 @@
 """Middleware for structured logging of tool calls."""
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -154,6 +155,13 @@ class CircuitMiddleware(Middleware):
     """Maestro handle bus (docs/reqs/007): expand any @@hN@@ handle in a tool's arguments before it runs, and
     park a large text result behind a handle on the way out so it can flow into the next tool by reference.
     No-op when the circuit env is absent (server run outside Maestro), so the server still works standalone.
+
+    Both calls run on a WORKER THREAD. circuit_buffer talks to Maestro's broker with `urllib`, which is
+    synchronous, so calling it from here put a blocking HTTP request with a 10 second timeout directly on
+    the event loop. Measured against an address that blackholes: one tool call took 10.1s and a heartbeat
+    coroutine ticked ONCE instead of a hundred times. The whole server was frozen, not just that call.
+    circuit_buffer stays synchronous on purpose (it satisfies a shared test vector with the TypeScript
+    half), so the seam that has to change is this one, the caller.
     """
 
     async def on_call_tool(
@@ -163,7 +171,9 @@ class CircuitMiddleware(Middleware):
     ) -> Any:  # noqa: ANN401
         try:
             if context.message is not None and getattr(context.message, "arguments", None):
-                context.message.arguments = circuit_buffer.resolve_args(context.message.arguments)
+                context.message.arguments = await asyncio.to_thread(
+                    circuit_buffer.resolve_args, context.message.arguments,
+                )
         except circuit_buffer.CircuitError:
             # A handle we cannot resolve is a FAILURE, not a hiccup. Swallowing it here ran the
             # tool with the literal "@@h3@@" in place of the payload the caller meant, and the
@@ -176,7 +186,7 @@ class CircuitMiddleware(Middleware):
         try:
             content = getattr(result, "content", None)
             if content and getattr(content[0], "type", None) == "text":
-                content[0].text = circuit_buffer.wrap_result(content[0].text)
+                content[0].text = await asyncio.to_thread(circuit_buffer.wrap_result, content[0].text)
         except Exception:  # noqa: BLE001
             pass
         return result
