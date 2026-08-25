@@ -73,6 +73,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # BEFORE the server is imported, so every logger in this process (ours, FastMCP's, and anything
+    # they pull in) writes through a stream that cannot block the event loop. See logging.py: with
+    # stderr piped and undrained, a synchronous write to a full pipe froze this server permanently
+    # on the 29th tool call.
+    from .logging import install_nonblocking_stderr  # noqa: PLC0415
+
+    install_nonblocking_stderr()
+
     from .server import mcp  # noqa: PLC0415
 
     with contextlib.suppress(KeyboardInterrupt):
